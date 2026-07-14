@@ -3,7 +3,7 @@ module github.com/uidbz/fyne-mpv-video
 go 1.22.0
 
 require (
-	fyne.io/fyne/v2 v2.0.0
+	fyne.io/fyne/v2 v2.8.0
 	github.com/go-gl/glfw/v3.4/glfw v0.1.0-pre.1.0.20260707082822-2a407d02d01a
 )
 
