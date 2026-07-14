@@ -1,0 +1,4 @@
+[submodule "fyne"]
+	path = fyne
+	url = https://github.com/uidbz/fyne.git
+	branch = feature/glvideo

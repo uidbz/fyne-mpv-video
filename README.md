@@ -11,7 +11,8 @@ X11, Wayland, macOS and Windows.
 
 This demo drives the `canvas.GLVideo` primitive proposed for Fyne upstream
 (see [fyne-io/fyne#449](https://github.com/fyne-io/fyne/issues/449)). Until that
-lands, `go.mod` uses a `replace` directive pointing at the fork that carries it.
+lands, the fork that carries it is included as a git submodule at `./fyne`, and
+`go.mod` has `replace fyne.io/fyne/v2 => ./fyne`.
 
 See [DOCUMENTATION.md](DOCUMENTATION.md) for a complete, top-to-bottom
 explanation of the approach, the frame flow, and every file.
@@ -20,8 +21,21 @@ explanation of the approach, the frame flow, and every file.
 
 - Go 1.22+
 - libmpv development headers (`libmpv-dev` / `media-video/mpv` with `libmpv` USE)
-- A checkout of the Fyne fork carrying `canvas.GLVideo`, next to this repo
-  (the `replace fyne.io/fyne/v2 => ../fyne` in `go.mod`)
+
+## Get the code
+
+The Fyne fork carrying `canvas.GLVideo` is a git submodule, so clone
+recursively:
+
+```sh
+git clone --recursive https://github.com/uidbz/fyne-mpv-video.git
+```
+
+If you already cloned without `--recursive`:
+
+```sh
+git submodule update --init
+```
 
 ## Build & run
 
