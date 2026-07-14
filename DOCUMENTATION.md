@@ -443,13 +443,18 @@ function pointers and struct arrays:
   `goGetProcAddress`. We need a real C function here because you cannot hand a Go
   function pointer directly to a C struct field.
 
-- **`make_gl_init_params(proc_ctx)`** — allocates and fills the parameter array
-  for `mpv_render_context_create`. It sets:
+- **`make_gl_init_params(proc_ctx, disp_type, disp)`** — allocates and fills the
+  parameter array for `mpv_render_context_create`. It sets:
   - `MPV_RENDER_PARAM_API_TYPE` = `MPV_RENDER_API_TYPE_OPENGL`,
   - `MPV_RENDER_PARAM_OPENGL_INIT_PARAMS` = a heap `mpv_opengl_init_params`
     holding our `get_proc_address_bridge` and the opaque `proc_ctx`,
   - `MPV_RENDER_PARAM_ADVANCED_CONTROL` = 1 (lets mpv schedule renders precisely
     and only redraw when needed),
+  - **optionally** the native display: `MPV_RENDER_PARAM_X11_DISPLAY` when
+    `disp_type == 1` or `MPV_RENDER_PARAM_WL_DISPLAY` when `disp_type == 2`, with
+    `disp` as the `Display*` / `wl_display*`. Skipped when `disp` is NULL or
+    `disp_type == 0`. This is the handle mpv needs for zero-copy GPU-decode
+    interop (see §6.7.4 and §7.10),
   - a terminating zero entry.
   Building this in C avoids Go having to take the address of the C function
   pointer or lay out the tagged-union `mpv_render_param` array itself.
@@ -506,7 +511,8 @@ Note the render context is *not* created here — see next.
 
 #### 6.7.4 Lazy render-context creation: `ensureRender()`
 
-Guarded by `initOnce`. On first call it builds the init params, calls
+Guarded by `initOnce`. On first call it queries the native display via
+`nativeDisplay()` (§7.10), builds the init params (passing that display), calls
 `mpv_render_context_create(&rctx, p.mpv, params)`, stores the context, registers
 the update callback, and issues `loadfile <file>` to begin playback.
 
@@ -514,7 +520,9 @@ the update callback, and issues `loadfile <file>` to begin playback.
 run on the thread that owns the GL context, with it current. The only place we
 are guaranteed to be on that thread is inside `RenderInto` (called by Fyne's
 painter). So we defer creation to the first `RenderInto`. This neatly sidesteps
-all "which thread am I on?" problems without any extra thread plumbing.
+all "which thread am I on?" problems without any extra thread plumbing. It also
+means GLFW is fully initialized by the time we read the native display handle —
+which it would not be back in `newMPVPlayer`, before Fyne creates its window.
 
 #### 6.7.5 Interface methods
 
@@ -655,6 +663,27 @@ calls `glfw.GetProcAddress`.
 
 ---
 
+### 6.11 `nativedisplay_*.go` (NEW) — native display lookup
+
+`nativeDisplay() (int, unsafe.Pointer)` returns the native display handle that
+`ensureRender` hands to mpv for zero-copy hardware-decode interop (§7.10). It
+returns a small code (1 = X11, 2 = Wayland, 0 = none) and the matching
+`Display*` / `wl_display*` as an opaque pointer.
+
+The reason this is **four build-tagged files** rather than one function is that
+GLFW's own native accessors live in mutually-exclusive tagged files —
+`GetX11Display` and `GetWaylandDisplay` are not both compiled in every
+configuration. The set mirrors GLFW's tags exactly:
+
+| File | Build tag | Behaviour |
+|------|-----------|-----------|
+| `nativedisplay_both.go` | linux/BSD, no `x11`/`wayland` tag | both linked; pick at runtime via `glfw.GetPlatform()` |
+| `nativedisplay_x11.go` | linux/BSD + `x11` | X11 only |
+| `nativedisplay_wayland.go` | linux/BSD + `wayland` | Wayland only |
+| `nativedisplay_other.go` | non-linux/BSD (macOS, Windows) | returns none — those platforms negotiate GPU interop without an X11/Wayland display param |
+
+---
+
 ## 7. The tricky details
 
 These are the non-obvious things that make or break the integration.
@@ -735,6 +764,31 @@ so exactly one compiles per target:
 
 This is what lets the same `canvas.GLVideo` render on a pure Wayland + EGL/GLES
 box, not just desktop GL (see §8.1).
+
+### 7.10 Native display for zero-copy hardware decode
+
+`hwdec=auto-safe` (set in `newMPVPlayer`) asks mpv to decode on the GPU. But
+decoding is only half of hardware acceleration: the decoded frame then has to
+reach *our* GL texture. Without help, mpv falls back to a **copy-back** path —
+GPU decode, copy the frame down to system RAM, re-upload it as a texture — which
+throws away much of the benefit.
+
+To keep the frame on the GPU (`VAAPI`/`dmabuf` → `EGLImage` → texture on Linux),
+mpv's render context needs the **native display handle**. We obtain it from GLFW
+(`GetX11Display` / `GetWaylandDisplay`, via `nativeDisplay()` — §6.11) inside
+`ensureRender`, where GLFW is guaranteed initialized and we are on the GL thread,
+and pass it as `MPV_RENDER_PARAM_X11_DISPLAY` / `MPV_RENDER_PARAM_WL_DISPLAY`.
+
+Two caveats:
+
+1. **This changes nothing in the Fyne fork.** The display handle comes from GLFW,
+   which the app already links, and is consumed entirely inside the backend's
+   `mpv_render_context_create`. The `GLVideoRenderer` interface is untouched.
+2. **The full zero-copy path is only realized on the EGL/GLES build.** Under a
+   desktop-GL/GLX context mpv may still copy even with the display wired, because
+   the dmabuf→EGLImage import needs EGL. So the payoff pairs this with
+   `-tags "wayland egl gles gles2"` (§8.1) — which is also the Wayland-native
+   path. This is wired but not yet verified on real hardware (§9 item 2).
 
 ---
 
@@ -869,9 +923,17 @@ decoding** in mpv, since that path wants EGL (see §9 item 2).
    `XDG_SESSION_TYPE=x11`. The rendering path is windowing-system-agnostic, so it
    is expected to work unchanged on Wayland, but this should be confirmed on an
    actual Wayland compositor.
-2. **Hardware decoding on Wayland/Intel** may require passing the native display
-   to mpv via `MPV_RENDER_PARAM_WL_DISPLAY` (GLFW can supply the `wl_display`).
-   Software decoding works everywhere as-is. Not yet wired.
+2. **Zero-copy hardware decode interop is now wired, but unverified.** The demo
+   passes the native display to mpv's render context
+   (`MPV_RENDER_PARAM_X11_DISPLAY` / `MPV_RENDER_PARAM_WL_DISPLAY`, sourced from
+   GLFW — see §6.7.4 and §7.10). With `hwdec=auto-safe` already set, this is what
+   lets mpv keep GPU-decoded frames on the GPU (VAAPI/dmabuf→EGLImage→texture)
+   instead of copying them back through system memory. The full zero-copy win is
+   only realized on the **EGL/GLES** build (`-tags "wayland egl gles gles2"`);
+   under a desktop-GL/GLX context mpv may still copy. Verified only that all tag
+   combinations build and run on X11; the actual zero-copy path needs confirming
+   on a real Wayland + EGL box (e.g. with `mpv --msg-level=vd=v` style logging or
+   a GPU profiler).
 3. **The `Video` widget lives in the demo.** Promoting it to a first-class,
    backend-neutral `fyne.io/fyne/v2/widget` would need a public home and a way to
    register a backend without a hard libmpv dependency in the toolkit.

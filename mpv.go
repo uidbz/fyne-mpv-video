@@ -19,24 +19,41 @@ static void *get_proc_address_bridge(void *ctx, const char *name) {
 
 // Build the OpenGL init params param array. Cgo cannot take the address of a C
 // function from Go, so we assemble the struct here.
-static mpv_render_param *make_gl_init_params(void *proc_ctx) {
+//
+// disp_type selects the optional native-display param that lets mpv set up
+// zero-copy GPU decode->GL interop (VAAPI/dmabuf->EGLImage) instead of copying
+// decoded frames back through system memory: 1 = X11 (disp is a Display*),
+// 2 = Wayland (disp is a wl_display*), 0 = none. disp may be NULL.
+static mpv_render_param *make_gl_init_params(void *proc_ctx, int disp_type, void *disp) {
     mpv_opengl_init_params *gl = calloc(1, sizeof(mpv_opengl_init_params));
     gl->get_proc_address = get_proc_address_bridge;
     gl->get_proc_address_ctx = proc_ctx;
 
-    mpv_render_param *params = calloc(4, sizeof(mpv_render_param));
-    static int api_type_len; // unused placeholder to keep layout obvious
-    (void)api_type_len;
+    // 3 base params + optional display + terminator.
+    mpv_render_param *params = calloc(5, sizeof(mpv_render_param));
 
     params[0].type = MPV_RENDER_PARAM_API_TYPE;
     params[0].data = MPV_RENDER_API_TYPE_OPENGL;
     params[1].type = MPV_RENDER_PARAM_OPENGL_INIT_PARAMS;
     params[1].data = gl;
-    params[2].type = MPV_RENDER_PARAM_ADVANCED_CONTROL;
     static int yes = 1;
+    params[2].type = MPV_RENDER_PARAM_ADVANCED_CONTROL;
     params[2].data = &yes;
-    params[3].type = 0;
-    params[3].data = NULL;
+
+    int idx = 3;
+    if (disp != NULL) {
+        if (disp_type == 1) {
+            params[idx].type = MPV_RENDER_PARAM_X11_DISPLAY;
+            params[idx].data = disp;
+            idx++;
+        } else if (disp_type == 2) {
+            params[idx].type = MPV_RENDER_PARAM_WL_DISPLAY;
+            params[idx].data = disp;
+            idx++;
+        }
+    }
+    params[idx].type = 0;
+    params[idx].data = NULL;
     return params;
 }
 
@@ -126,7 +143,8 @@ func (p *mpvPlayer) SetOnUpdate(fn func()) { p.onUpdate = fn }
 func (p *mpvPlayer) ensureRender() error {
 	p.initOnce.Do(func() {
 		handle := unsafe.Pointer(uintptr(p.self))
-		params := C.make_gl_init_params(handle)
+		dispType, disp := nativeDisplay()
+		params := C.make_gl_init_params(handle, C.int(dispType), disp)
 		defer C.free_gl_init_params(params)
 
 		var rctx *C.mpv_render_context
