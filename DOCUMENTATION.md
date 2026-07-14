@@ -113,30 +113,31 @@ Two consequences shaped the design:
 
 ## 4. Architecture overview
 
-The implementation is split deliberately across **two modules**:
+The implementation is split deliberately across **two modules** — this
+application repo, and the Fyne fork it vendors as a submodule under `./fyne`:
 
 ```
-fynempv/
-├── fyne/                       ← the Fyne fork (patched)
-│   ├── canvas/glvideo.go               NEW  – the GLVideo object + interface
-│   └── internal/painter/gl/
-│       ├── painter.go                  EDIT – FBO cache fields + cleanup hook
-│       ├── draw.go                     EDIT – one new type-switch case
-│       ├── glvideo_desktop.go          NEW  – the real FBO drawing (desktop GL)
-│       └── glvideo_other.go            NEW  – no-op stub (mobile/web/ES)
+fyne-mpv-video/                 ← this repo: the application (all libmpv/cgo lives here)
+├── go.mod                          replace fyne.io/fyne/v2 => ./fyne
+├── mpv.go                          NEW  – libmpv cgo bindings + Render API
+├── video_widget.go                 NEW  – reusable Video widget + controls
+├── main.go                         NEW  – tiny entry point
 │
-└── demo/                       ← the application (all libmpv/cgo lives here)
-    ├── go.mod                          replace fyne.io/fyne/v2 => ../fyne
-    ├── mpv.go                          NEW  – libmpv cgo bindings + Render API
-    ├── video_widget.go                 NEW  – reusable Video widget + controls
-    └── main.go                         NEW  – tiny entry point
+└── fyne/                       ← the Fyne fork, included as a git submodule (branch feature/glvideo)
+    ├── canvas/glvideo.go               NEW  – the GLVideo object + interface
+    └── internal/painter/gl/
+        ├── painter.go                  EDIT – FBO cache fields + cleanup hook
+        ├── draw.go                     EDIT – one new type-switch case
+        ├── glvideo_desktop.go          NEW  – the real FBO drawing (desktop GL)
+        ├── glvideo_gles.go             NEW  – the same FBO drawing (OpenGL ES / GLES)
+        └── glvideo_other.go            NEW  – no-op stub (mobile/web only)
 ```
 
 **The key architectural rule: the Fyne fork contains *no* mpv or cgo code.**
 
 The fork only knows about an abstract interface, `canvas.GLVideoRenderer`, which
 says "something can draw a frame into an FBO." libmpv is one implementation of
-that interface, and it lives entirely in the application (`demo/`). This means:
+that interface, and it lives entirely in the application (this repo). This means:
 
 - The fork change is small, generic, and reusable — any GL video source (mpv,
   GStreamer, a custom decoder, a WebRTC frame pipeline) can implement the same
@@ -322,7 +323,8 @@ Why raw go-gl instead of the painter's abstract `context` interface? That
 interface (in `context.go`) has no framebuffer-object methods
 (`GenFramebuffers`, `BindFramebuffer`, `FramebufferTexture2D`, …). Rather than
 widen that interface across all five backends, the FBO handling is isolated in
-this one desktop-tagged file, with a no-op stub for the others (§6.5).
+per-backend files: this desktop-GL one, a matching OpenGL ES one (§6.5), and a
+no-op stub for the rest (§6.6).
 
 **`drawGLVideo(v, pos, frame)`** does, in order:
 
@@ -391,24 +393,38 @@ map entry. Called from `painter.Free`.
 
 ---
 
-### 6.5 `fyne/internal/painter/gl/glvideo_other.go` (NEW)
+### 6.5 `fyne/internal/painter/gl/glvideo_gles.go` (NEW)
 
-The complement build tag (everything the desktop file excludes: gles, arm,
-mobile, wasm). It provides no-op `drawGLVideo` and `freeVideoTarget` methods so
-the package still compiles on those targets — a `GLVideo` simply draws nothing
-there. This keeps `drawObject`'s reference to `drawGLVideo` valid on every
-platform without pulling FBO code into backends that may not support it the same
-way.
+The OpenGL ES counterpart, compiled when Fyne uses its **GLES painter** — the
+build tag matches `(gles || arm || arm64)` on non-mobile, non-darwin, non-wasm
+targets. It is what makes video work on a pure Wayland + EGL/GLES machine (see
+§8.1), where the desktop-GL file is excluded.
+
+Framebuffer objects are **core in OpenGL ES 2.0**, so the code is a near-exact
+mirror of `glvideo_desktop.go` — same `drawGLVideo` letterbox logic, same
+`ensureVideoTarget` allocation, same `freeVideoTarget` — with one difference: it
+imports `github.com/go-gl/gl/v3.1/gles2` instead of `.../v2.1/gl`. The FBO calls
+(`GenFramebuffers`, `BindFramebuffer`, `FramebufferTexture2D`, `TexImage2D` with
+`RGBA`/`UNSIGNED_BYTE`) are identical between the two bindings.
+
+### 6.6 `fyne/internal/painter/gl/glvideo_other.go` (NEW)
+
+The complement build tag (everything the desktop and GLES files both exclude:
+mobile — android/ios — and wasm/test_web_driver). It provides no-op
+`drawGLVideo` and `freeVideoTarget` methods so the package still compiles on
+those targets — a `GLVideo` simply draws nothing there. This keeps
+`drawObject`'s reference to `drawGLVideo` valid on every platform without pulling
+FBO code into backends that do not support it.
 
 ---
 
-### 6.6 `demo/mpv.go` (NEW) — the libmpv backend
+### 6.7 `mpv.go` (NEW) — the libmpv backend
 
 This is the only file containing cgo and libmpv. It implements
 `canvas.GLVideoRenderer` plus playback controls. It is in `package main` in the
-demo module.
+application module.
 
-#### 6.6.1 The C preamble
+#### 6.7.1 The C preamble
 
 The comment block above `import "C"` is compiled as C. `#cgo pkg-config: mpv`
 tells cgo to pull compiler/linker flags from `pkg-config mpv` (so it finds
@@ -418,7 +434,7 @@ It defines several small C helpers, needed because cgo has awkward edges around
 function pointers and struct arrays:
 
 - **`goGetProcAddress` / `goRenderUpdate`** — forward declarations of the two
-  Go functions we export back to C (see §6.6.5). Note `goGetProcAddress` takes
+  Go functions we export back to C (see §6.7.5). Note `goGetProcAddress` takes
   `char *` (not `const char *`) to match the signature cgo generates for the
   exported Go function; the trampoline casts away `const`.
 
@@ -450,7 +466,7 @@ function pointers and struct arrays:
 - **`set_update_callback`** — wraps `mpv_render_context_set_update_callback`,
   registering `goRenderUpdate` with an opaque context pointer.
 
-#### 6.6.2 The `mpvPlayer` struct
+#### 6.7.2 The `mpvPlayer` struct
 
 ```go
 type mpvPlayer struct {
@@ -474,7 +490,7 @@ type mpvPlayer struct {
   Go object.
 - `file` — the media path/URL to play.
 
-#### 6.6.3 Construction: `newMPVPlayer(file)`
+#### 6.7.3 Construction: `newMPVPlayer(file)`
 
 1. `C.mpv_create()` allocates the handle.
 2. `C.mpv_initialize(h)` starts the core; on error we `mpv_terminate_destroy` and
@@ -488,7 +504,7 @@ type mpvPlayer struct {
 
 Note the render context is *not* created here — see next.
 
-#### 6.6.4 Lazy render-context creation: `ensureRender()`
+#### 6.7.4 Lazy render-context creation: `ensureRender()`
 
 Guarded by `initOnce`. On first call it builds the init params, calls
 `mpv_render_context_create(&rctx, p.mpv, params)`, stores the context, registers
@@ -500,7 +516,7 @@ are guaranteed to be on that thread is inside `RenderInto` (called by Fyne's
 painter). So we defer creation to the first `RenderInto`. This neatly sidesteps
 all "which thread am I on?" problems without any extra thread plumbing.
 
-#### 6.6.5 Interface methods
+#### 6.7.5 Interface methods
 
 - **`RenderInto(fbo, w, h)`** — calls `ensureRender()`, clears `needsPaint`, then
   `C.render_to_fbo(...)`. This is the method Fyne's `drawGLVideo` calls.
@@ -509,7 +525,7 @@ all "which thread am I on?" problems without any extra thread plumbing.
   0 when unknown (before the first frame is decoded), which the painter treats as
   "fill."
 
-#### 6.6.6 Playback controls
+#### 6.7.6 Playback controls
 
 Thin wrappers over mpv properties/commands:
 
@@ -520,7 +536,7 @@ Thin wrappers over mpv properties/commands:
 - `Duration` — reads `duration` (seconds, double; 0 if unknown).
 - `SeekTo(seconds)` — issues the `seek <seconds> absolute` command.
 
-#### 6.6.7 Property/command helpers
+#### 6.7.7 Property/command helpers
 
 - `getPropertyDouble(name)` / `getPropertyFlag(name)` — call `mpv_get_property`
   with `MPV_FORMAT_DOUBLE` / `MPV_FORMAT_FLAG` into a C variable, guarding against
@@ -533,13 +549,13 @@ Thin wrappers over mpv properties/commands:
 - `checkMPV(status)` — converts a negative mpv status code into a Go error via
   `mpv_error_string`.
 
-#### 6.6.8 Teardown: `Close()`
+#### 6.7.8 Teardown: `Close()`
 
 Frees the render context (`mpv_render_context_free`), terminates the core
 (`mpv_terminate_destroy`), and deletes the `cgo.Handle`. Each step is guarded so
 `Close` is idempotent-ish (safe to call once; nils out the fields).
 
-#### 6.6.9 The exported callbacks
+#### 6.7.9 The exported callbacks
 
 - **`goGetProcAddress(ctx, name)`** (`//export`) — resolves an OpenGL function
   name to a pointer using `glfw.GetProcAddress`. libmpv calls this (via the C
@@ -551,7 +567,7 @@ Frees the render context (`mpv_render_context_free`), terminates the core
 
 ---
 
-### 6.7 `demo/video_widget.go` (NEW) — the reusable `Video` widget
+### 6.8 `video_widget.go` (NEW) — the reusable `Video` widget
 
 Wraps the raw `canvas.GLVideo` with playback controls into a proper Fyne widget.
 
@@ -609,7 +625,7 @@ the left, the clock on the right, and the seek slider filling the middle.
 
 ---
 
-### 6.8 `demo/main.go` (NEW) — entry point
+### 6.9 `main.go` (NEW) — entry point
 
 Minimal:
 
@@ -624,17 +640,18 @@ Minimal:
 
 ---
 
-### 6.9 `demo/go.mod`
+### 6.10 `go.mod`
 
 Standard module file with one important line:
 
 ```
-replace fyne.io/fyne/v2 => ../fyne
+replace fyne.io/fyne/v2 => ./fyne
 ```
 
-This makes the demo build against the **local patched fork** rather than the
-published Fyne, so the new `canvas.GLVideo` type is available. `go-gl/glfw` is a
-direct dependency because `goGetProcAddress` calls `glfw.GetProcAddress`.
+This makes the demo build against the **patched fork** (vendored as the `./fyne`
+git submodule) rather than the published Fyne, so the new `canvas.GLVideo` type
+is available. `go-gl/glfw` is a direct dependency because `goGetProcAddress`
+calls `glfw.GetProcAddress`.
 
 ---
 
@@ -705,10 +722,19 @@ temporarily fills the box, then snaps to the correct ratio once known.
 
 ### 7.9 The build-tag split
 
-FBO code is desktop-only (`glvideo_desktop.go`) because the abstract painter
-`context` interface has no framebuffer methods and ES/mobile/web GL differs. The
-stub (`glvideo_other.go`) keeps every platform compiling. Extending to mobile/ES
-would mean adding an ES implementation with the matching build tag.
+FBO code lives in per-backend files because the abstract painter `context`
+interface has no framebuffer methods. There are two real implementations —
+`glvideo_desktop.go` (desktop OpenGL, `go-gl/gl/v2.1/gl`) and `glvideo_gles.go`
+(OpenGL ES, `go-gl/gl/v3.1/gles2`) — plus `glvideo_other.go`, a no-op stub that
+keeps mobile and web/wasm compiling. The three build tags are mutually exclusive
+so exactly one compiles per target:
+
+- desktop core (and non-mobile darwin) → `glvideo_desktop.go`
+- `gles` / arm / arm64 → `glvideo_gles.go`
+- android / ios / wasm / test_web_driver → `glvideo_other.go`
+
+This is what lets the same `canvas.GLVideo` render on a pure Wayland + EGL/GLES
+box, not just desktop GL (see §8.1).
 
 ---
 
@@ -724,12 +750,20 @@ would mean adding an ES implementation with the matching build tag.
   ```
 - The usual Fyne/GLFW system deps (X11/Wayland/OpenGL dev packages).
 
+**Get the code** (the Fyne fork is a submodule, so clone recursively):
+
+```
+git clone --recursive https://github.com/uidbz/fyne-mpv-video.git
+cd fyne-mpv-video
+```
+
+If you already cloned without `--recursive`, run `git submodule update --init`.
+
 **Build and run:**
 
 ```
-cd demo
 go build .
-./fynempvdemo /path/to/video.mp4
+./fyne-mpv-video /path/to/video.mp4
 ```
 
 You can also pass a URL that mpv understands. To generate a quick test clip:
