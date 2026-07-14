@@ -1,0 +1,4 @@
+# build output
+/fyne-mpv-video
+/fynempvdemo
+*.exe
