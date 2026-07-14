@@ -1,0 +1,8 @@
+[Details]
+Name = "Fyne mpv video"
+ID = "io.fyne.mpvdemo"
+Version = "1.0.0"
+Build = 1
+
+[Migrations]
+fyneDo = true
