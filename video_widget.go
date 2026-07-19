@@ -39,13 +39,19 @@ type Video struct {
 	seek    *widget.Slider
 	timeLbl *widget.Label
 
-	stop     chan struct{}
-	seeking  bool // true while the user drags the slider, to suppress feedback
+	stop         chan struct{}
+	seeking      bool          // true while the user drags the slider, to suppress feedback
+	settingSeek  bool          // true while the ticker programmatically updates the slider
+	frameReady   chan struct{} // signals when a new frame is ready for display
 }
 
 // NewVideo returns a Video widget backed by the given controller.
 func NewVideo(player videoController) *Video {
-	v := &Video{player: player, stop: make(chan struct{})}
+	v := &Video{
+		player:     player,
+		stop:       make(chan struct{}),
+		frameReady: make(chan struct{}, 1), // buffered to coalesce signals
+	}
 	v.ExtendBaseWidget(v)
 
 	v.video = canvas.NewGLVideo(player)
@@ -56,19 +62,56 @@ func NewVideo(player videoController) *Video {
 
 	v.seek = widget.NewSlider(0, 1)
 	v.seek.Step = 0.001
+	// SetValue fires OnChanged and OnChangeEnded just like a user interaction,
+	// so the ticker's programmatic slider updates would otherwise seek the video
+	// to the (rounded) current position every time the slider ticks up a step -
+	// once every Step*duration seconds (~7s for a 2h file), causing a periodic
+	// stall. settingSeek lets the callbacks ignore those self-inflicted updates.
 	v.seek.OnChangeEnded = func(val float64) {
+		if v.settingSeek {
+			return
+		}
 		if dur := v.player.Duration(); dur > 0 {
 			v.player.SeekTo(val * dur)
 		}
 		v.seeking = false
 	}
-	v.seek.OnChanged = func(float64) { v.seeking = true }
+	v.seek.OnChanged = func(float64) {
+		if v.settingSeek {
+			return
+		}
+		v.seeking = true
+	}
 
-	// Repaint the frame whenever mpv produces a new one.
-	player.SetOnUpdate(func() { fyne.Do(v.video.Refresh) })
+	// Signal when a new frame is ready. Multiple signals are coalesced by the
+	// buffered channel, preventing UI thread overload.
+	player.SetOnUpdate(func() {
+		select {
+		case v.frameReady <- struct{}{}:
+		default:
+			// Channel full means a refresh is already pending, skip
+		}
+	})
 
 	go v.tick()
+	go v.refreshLoop()
 	return v
+}
+
+// refreshLoop waits for frame-ready signals and triggers redraws on the UI
+// thread. By using a dedicated goroutine and buffered channel, we coalesce
+// multiple rapid update notifications into single refresh calls, preventing UI
+// thread saturation while ensuring every frame gets displayed.
+func (v *Video) refreshLoop() {
+	for {
+		select {
+		case <-v.stop:
+			return
+		case <-v.frameReady:
+			// Process the frame ready signal immediately
+			fyne.Do(v.video.Refresh)
+		}
+	}
 }
 
 func (v *Video) togglePlay() {
@@ -93,7 +136,9 @@ func (v *Video) tick() {
 			fyne.Do(func() {
 				v.timeLbl.SetText(formatTime(pos) + " / " + formatTime(dur))
 				if dur > 0 && !v.seeking {
+					v.settingSeek = true
 					v.seek.SetValue(pos / dur)
+					v.settingSeek = false
 				}
 			})
 		}

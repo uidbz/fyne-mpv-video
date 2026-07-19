@@ -63,8 +63,10 @@ static void free_gl_init_params(mpv_render_param *params) {
     free(params);
 }
 
-// Render the current frame into the given FBO. flip_y=1 renders with a flipped
-// Y axis so the result matches Fyne's top-left texture origin convention.
+// Render the current frame into the given FBO. flip_y stays 0: Fyne samples this
+// FBO's colour texture with the same v=0-at-top convention it uses for uploaded
+// images (see rectCoords in the painter), so mpv's default (unflipped) output
+// already lands right-side up. Setting flip_y=1 renders the frame upside down.
 static int render_to_fbo(mpv_render_context *ctx, int fbo, int w, int h) {
     mpv_opengl_fbo target;
     target.fbo = fbo;
@@ -72,7 +74,7 @@ static int render_to_fbo(mpv_render_context *ctx, int fbo, int w, int h) {
     target.h = h;
     target.internal_format = 0;
 
-    int flip_y = 1;
+    int flip_y = 0;
     mpv_render_param params[3];
     params[0].type = MPV_RENDER_PARAM_OPENGL_FBO;
     params[0].data = &target;
@@ -114,6 +116,10 @@ type mpvPlayer struct {
 
 	self cgo.Handle // stable handle passed to C callbacks
 	file string
+
+	stop     chan struct{} // closed to stop the event loop
+	stopOnce sync.Once
+	done     chan struct{} // closed when the event loop has exited
 }
 
 func newMPVPlayer(file string) (*mpvPlayer, error) {
@@ -129,9 +135,42 @@ func newMPVPlayer(file string) (*mpvPlayer, error) {
 	setOption(h, "hwdec", "auto-safe")
 	setOption(h, "vo", "libmpv")
 
-	p := &mpvPlayer{mpv: h, file: file}
+	p := &mpvPlayer{mpv: h, file: file, stop: make(chan struct{}), done: make(chan struct{})}
 	p.self = cgo.NewHandle(p)
+
+	// Drain mpv's event queue continuously. This is mandatory: libmpv buffers
+	// events (including internal wakeups) in a fixed-size queue, and if the
+	// client never consumes them the queue fills up and mpv throttles/stalls
+	// playback - which shows up as "plays a few seconds, then pauses, then
+	// resumes". Consuming events keeps the pipeline flowing.
+	go p.eventLoop()
+
 	return p, nil
+}
+
+// eventLoop drains mpv's event queue until the player is closed. mpv_wait_event
+// must be called from a single thread; this goroutine owns that duty.
+func (p *mpvPlayer) eventLoop() {
+	defer close(p.done)
+	for {
+		select {
+		case <-p.stop:
+			return
+		default:
+		}
+		// Block up to 100ms waiting for the next event. Returning periodically
+		// lets us observe the stop signal even when no events arrive.
+		ev := C.mpv_wait_event(p.mpv, C.double(0.1))
+		if ev == nil {
+			continue
+		}
+		switch ev.event_id {
+		case C.MPV_EVENT_NONE:
+			// Timeout, nothing to do.
+		case C.MPV_EVENT_SHUTDOWN:
+			return
+		}
+	}
 }
 
 // SetOnUpdate registers a callback invoked whenever mpv signals a new frame.
@@ -220,6 +259,12 @@ func (p *mpvPlayer) SeekTo(seconds float64) {
 
 // Close stops playback and releases all mpv resources. Safe to call once.
 func (p *mpvPlayer) Close() {
+	// Stop the event loop and wait for it to exit before destroying the handle,
+	// so it never calls mpv_wait_event on a freed handle.
+	if p.stop != nil {
+		p.stopOnce.Do(func() { close(p.stop) })
+		<-p.done
+	}
 	if p.render != nil {
 		C.mpv_render_context_free(p.render)
 		p.render = nil
